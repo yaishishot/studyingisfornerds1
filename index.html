@@ -577,44 +577,64 @@ function uvToWindSpeedDir(u, v) {
 
 // --- API FETCH ---
 async function fetchWindy(apiKey) {
-  const now = Date.now();
-  const hours = [];
-  // Request next 48 hours
-  for (let i = 0; i < 48; i++) hours.push(now + i * 3600 * 1000);
+  const base = { lat: LAT, lon: LNG, levels: ['surface'], key: apiKey };
 
-  const body = {
-    lat: LAT,
-    lon: LNG,
-    model: 'gfsWave',
-    parameters: ['waves', 'swell1', 'swell2', 'wind', 'windGust'],
-    levels: ['surface'],
-    key: apiKey
-  };
+  const [waveRes, windRes] = await Promise.all([
+    fetch('https://api.windy.com/api/point-forecast/v2', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...base, model: 'gfsWave', parameters: ['waves', 'swell1', 'swell2', 'wavesPower'] })
+    }),
+    fetch('https://api.windy.com/api/point-forecast/v2', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...base, model: 'gfs', parameters: ['wind'] })
+    })
+  ]);
 
-  const res = await fetch('https://api.windy.com/api/point-forecast/v2', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
+  if (!waveRes.ok) {
+    const txt = await waveRes.text();
+    throw new Error(`API ${waveRes.status}: ${txt.slice(0, 200)}`);
+  }
+  if (!windRes.ok) {
+    const txt = await windRes.text();
+    throw new Error(`API ${windRes.status}: ${txt.slice(0, 200)}`);
+  }
+
+  const [waveData, windData] = await Promise.all([waveRes.json(), windRes.json()]);
+
+  // Merge wind into wave data keyed by timestamp
+  const windByTs = {};
+  (windData.ts || []).forEach((t, i) => {
+    windByTs[t] = {
+      u: (windData['wind_u-surface'] || [])[i] || 0,
+      v: (windData['wind_v-surface'] || [])[i] || 0
+    };
   });
 
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`API ${res.status}: ${txt.slice(0, 200)}`);
-  }
-  return res.json();
+  waveData._windByTs = windByTs;
+  return waveData;
 }
 
 // --- PARSE DATA ---
 function parseData(data) {
-  const ts = data.ts; // array of unix ms timestamps
+  const ts = data.ts;
+  const windByTs = data._windByTs || {};
+
+  // Prefer combined waves; fall back to swell1
   const wh = data['waves_height-surface'] || data['swell1_height-surface'] || [];
   const wp = data['waves_period-surface'] || data['swell1_period-surface'] || [];
   const wd = data['waves_direction-surface'] || data['swell1_direction-surface'] || [];
-  const wu = data['wind_u-surface'] || [];
-  const wv = data['wind_v-surface'] || [];
 
   return ts.map((t, i) => {
-    const wind = uvToWindSpeedDir(wu[i] || 0, wv[i] || 0);
+    // Find nearest wind timestamp (gfs may be on different cadence)
+    let wEntry = windByTs[t];
+    if (!wEntry) {
+      const nearest = Object.keys(windByTs).reduce((best, k) =>
+        Math.abs(k - t) < Math.abs(best - t) ? k : best, Object.keys(windByTs)[0]);
+      wEntry = windByTs[nearest] || { u: 0, v: 0 };
+    }
+    const wind = uvToWindSpeedDir(wEntry.u, wEntry.v);
     return {
       ts: t,
       date: new Date(t),
